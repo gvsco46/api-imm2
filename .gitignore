@@ -1,0 +1,8 @@
+node_modules/
+roleta.db
+roleta.db-wal
+roleta.db-shm
+session-cookies.json
+erro-*.png
+*.log
+.env

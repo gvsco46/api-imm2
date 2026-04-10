@@ -1,0 +1,20 @@
+{
+  "name": "api-roleta-immersive",
+  "version": "3.0.0",
+  "description": "API que captura números da Immersive Roulette (Evolution Gaming) via Superbet",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "HEADLESS=false node server.js",
+    "start:headless": "HEADLESS=true node server.js"
+  },
+  "keywords": ["roleta", "roulette", "evolution", "superbet", "scraper"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "express": "^5.2.1",
+    "playwright": "^1.59.1"
+  }
+}
