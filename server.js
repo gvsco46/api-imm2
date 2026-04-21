@@ -1,13 +1,21 @@
 /**
- * API Roleta Immersive — Scraper + REST API (Produção v3)
+ * API Roleta Immersive — Scraper + REST API (Produção v3.1)
  *
  * Captura números da Immersive Roulette (Evolution Gaming) no Superbet
  * via CDP (Chrome DevTools Protocol) para acessar iframes cross-origin.
  *
+ * ── AUTENTICAÇÃO VIA SESSION INJECTION ──────────────────────────────────────
+ * O Superbet exige reconhecimento facial, impossibilitando login automático.
+ * A sessão é injetada via storageState (auth.json), gerado pelo script:
+ *
+ *   node login-manual.js   ← roda LOCALMENTE, você faz o login à mão
+ *
+ * O auth.json gerado deve ser transferido para o servidor antes de iniciar.
+ * ────────────────────────────────────────────────────────────────────────────
+ *
  * Features:
- *   - Login automático com credenciais
- *   - Persistência de sessão via cookies
- *   - Re-login automático quando sessão expira
+ *   - Session Injection via storageState (auth.json)
+ *   - Sem tentativa de login automático (facial recognition bloquearia)
  *   - Reconexão automática em caso de erro
  *   - Modo headless para produção
  *   - Graceful shutdown
@@ -21,9 +29,8 @@
  * ENV:
  *   PORT            → porta da API (padrão: 3000)
  *   HEADLESS        → "true"/"false" (padrão: true)
- *   SUPERBET_USER   → usuário Superbet
- *   SUPERBET_PASS   → senha Superbet
  *   POLL_INTERVAL   → intervalo de polling em ms (padrão: 5000)
+ *   AUTH_PATH       → caminho do auth.json (padrão: ./auth.json)
  */
 
 const { chromium } = require("playwright");
@@ -38,12 +45,13 @@ const fs = require("fs");
 const PORT = parseInt(process.env.PORT) || 3000;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL) || 5000;
 const MAX_ERRORS_BEFORE_RESTART = 60;
+// Watchdog: se não houver número NOVO em X ms, recarrega o jogo
+// Roleta ~50s/rodada → 5 rodadas sem captura = alarme (padrão: 5 min)
+const STALE_TIMEOUT_MS = parseInt(process.env.STALE_TIMEOUT_MS) || 5 * 60 * 1000;
 const DB_PATH = path.join(__dirname, "roleta.db");
-const COOKIES_PATH = path.join(__dirname, "session-cookies.json");
+const AUTH_PATH = process.env.AUTH_PATH || path.join(__dirname, "auth.json");
 const GAME_URL = "https://superbet.bet.br/jogo/immersive-roulette/814483?demo=false";
 const HOME_URL = "https://superbet.bet.br";
-const USERNAME = process.env.SUPERBET_USER || "analistamamede";
-const PASSWORD = process.env.SUPERBET_PASS || "@Paula03111992";
 const HEADLESS = process.env.HEADLESS !== "false";
 
 // ═══════════════════════════════════════════════════════
@@ -80,6 +88,7 @@ const lastRowStmt = db.prepare(
 let scraperStatus = "iniciando";
 let lastNumbers = [];
 let lastUpdate = null;
+let lastNewNumberAt = null;   // timestamp do último número NOVO capturado
 let errorCount = 0;
 let consecutiveErrors = 0;
 let totalCaptured = 0;
@@ -98,8 +107,49 @@ function log(msg) {
 async function runScraper() {
   log("🚀 Iniciando scraper...");
   log(`   Modo: ${HEADLESS ? "headless" : "visível"}`);
-  log(`   Usuário: ${USERNAME}`);
   log(`   Poll: ${POLL_INTERVAL}ms`);
+
+  // ─── Verificar auth.json antes de tudo ───
+  const hasAuth = fs.existsSync(AUTH_PATH);
+  if (!hasAuth) {
+    log("");
+    log("╔══════════════════════════════════════════════════════════════════╗");
+    log("║  ⛔  auth.json NÃO ENCONTRADO                                   ║");
+    log("║                                                                  ║");
+    log("║  Execute LOCALMENTE para gerar a sessão:                         ║");
+    log("║    node login-manual.js                                          ║");
+    log("║                                                                  ║");
+    log("║  Depois transfira o auth.json gerado para este servidor e        ║");
+    log("║  reinicie o bot.                                                 ║");
+    log("╚══════════════════════════════════════════════════════════════════╝");
+    log("");
+    scraperStatus = "aguardando_auth";
+    // Fica em loop de espera sem travar o processo — a API continua respondendo
+    await new Promise((resolve) => {
+      const check = setInterval(() => {
+        if (fs.existsSync(AUTH_PATH)) {
+          log("✅ auth.json detectado! Iniciando scraper...");
+          clearInterval(check);
+          resolve();
+        } else {
+          log("⏳ Aguardando auth.json... (rode: node login-manual.js)");
+        }
+      }, 30000);
+    });
+  }
+
+  // ─── Validar auth.json ───
+  let authState;
+  try {
+    authState = JSON.parse(fs.readFileSync(AUTH_PATH, "utf8"));
+    log(`🔑 auth.json carregado (${authState.cookies?.length ?? 0} cookies, ${Object.keys(authState.origins ?? {}).length} origens)`);
+  } catch (e) {
+    log(`❌ auth.json corrompido ou inválido: ${e.message}`);
+    log("   Delete o arquivo e rode: node login-manual.js");
+    scraperStatus = "erro_auth";
+    throw new Error("auth.json inválido");
+  }
+
   scraperStatus = "abrindo_browser";
 
   browser = await chromium.launch({
@@ -114,25 +164,14 @@ async function runScraper() {
     ],
   });
 
-  const hasCookies = fs.existsSync(COOKIES_PATH);
   const contextOptions = {
+    storageState: AUTH_PATH, // ← Injeta a sessão completa (cookies + localStorage)
     viewport: { width: 1920, height: 1080 },
     userAgent:
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     geolocation: { latitude: -23.5505, longitude: -46.6333 },
     permissions: ["geolocation"],
   };
-
-  if (hasCookies) {
-    try {
-      JSON.parse(fs.readFileSync(COOKIES_PATH, "utf8"));
-      contextOptions.storageState = COOKIES_PATH;
-      log("🔑 Cookies carregados");
-    } catch (e) {
-      log("⚠️ Cookies corrompidos, ignorando");
-      fs.unlinkSync(COOKIES_PATH);
-    }
-  }
 
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
@@ -170,7 +209,7 @@ async function runScraper() {
     }
   }
 
-  // ─── Helper: verificar se está logado ───
+  // ─── Helper: verificar se ainda está logado ───
   async function isLoggedIn() {
     try {
       const entrarBtn = page.locator("button.e2e-login");
@@ -180,100 +219,59 @@ async function runScraper() {
     }
   }
 
-  // ─── Helper: fazer login ───
-  async function doLogin() {
-    scraperStatus = "fazendo_login";
-    log("🔐 Fazendo login automático...");
-
-    try {
-      await page.locator("button.e2e-login").click({ force: true });
-      await page.waitForTimeout(2000);
-    } catch (e) {
-      await page.evaluate(() => {
-        for (const btn of document.querySelectorAll("button, a")) {
-          if (btn.textContent.trim().toLowerCase() === "entrar" && btn.offsetParent) {
-            btn.click();
-            return;
+  // ─── Helper: sessão expirada — não tenta re-login, apenas avisa ───
+  async function handleSessionExpired() {
+    scraperStatus = "sessao_expirada";
+    log("");
+    log("╔══════════════════════════════════════════════════════════════════╗");
+    log("║  ⚠️  SESSÃO EXPIRADA — auth.json inválido                       ║");
+    log("║                                                                  ║");
+    log("║  1. Execute LOCALMENTE: node login-manual.js                     ║");
+    log("║  2. Transfira o novo auth.json para o servidor                   ║");
+    log("║  3. O bot detectará o novo arquivo automaticamente               ║");
+    log("╚══════════════════════════════════════════════════════════════════╝");
+    log("");
+    // Aguarda novo auth.json ser transferido (troca de arquivo em disco)
+    const oldMtime = fs.statSync(AUTH_PATH).mtimeMs;
+    await new Promise((resolve) => {
+      const check = setInterval(() => {
+        try {
+          const newMtime = fs.statSync(AUTH_PATH).mtimeMs;
+          if (newMtime !== oldMtime) {
+            log("✅ Novo auth.json detectado! Reiniciando scraper...");
+            clearInterval(check);
+            resolve();
+          } else {
+            log("⏳ Aguardando novo auth.json...");
           }
+        } catch (e) {
+          log("⏳ Aguardando auth.json...");
         }
-      });
-      await page.waitForTimeout(3000);
-    }
-
-    const usernameInput = page.locator('input[name="username"]');
-    const formVisible = await usernameInput
-      .isVisible({ timeout: 8000 })
-      .catch(() => false);
-
-    if (!formVisible) {
-      log("❌ Formulário de login não apareceu");
-      await page.screenshot({ path: path.join(__dirname, "erro-login.png") });
-      return false;
-    }
-
-    await usernameInput.fill(USERNAME);
-    await page.locator('input[name="password"]').fill(PASSWORD);
-    await page.waitForTimeout(300);
-
-    const submitBtn = page.locator('button[type="submit"].sds-button--block');
-    if (await submitBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await submitBtn.click({ force: true });
-    } else {
-      await page.locator('input[name="password"]').press("Enter");
-    }
-
-    log("   Aguardando resposta do login...");
-    await page.waitForTimeout(6000);
-    await dismissPopups();
-
-    let success = await isLoggedIn();
-    if (!success) {
-      await dismissPopups();
-      await page.waitForTimeout(2000);
-      success = await isLoggedIn();
-    }
-
-    if (success) {
-      log("✅ Login realizado com sucesso!");
-      await context.storageState({ path: COOKIES_PATH });
-      log("💾 Cookies salvos");
-      return true;
-    }
-
-    log("❌ Login falhou!");
-    await page.screenshot({ path: path.join(__dirname, "erro-login.png") });
-    return false;
+      }, 30000);
+    });
+    // Reinicia o scraper com a sessão nova
+    try { await browser.close(); } catch (e) {}
+    browser = null;
+    restartCount++;
+    startScraper();
+    throw new Error("Reiniciando com nova sessão"); // encerra o runScraper atual
   }
 
   // ═══ ETAPA 1: ACESSAR SUPERBET ═══
   scraperStatus = "acessando_superbet";
-  log("🌐 Abrindo Superbet...");
+  log("🌐 Abrindo Superbet (com sessão injetada)...");
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(4000);
   await dismissPopups();
   await page.waitForTimeout(1000);
 
-  // ═══ ETAPA 2: LOGIN ═══
+  // ═══ ETAPA 2: VERIFICAR SESSÃO (não tenta login automático) ═══
   if (!(await isLoggedIn())) {
-    const loginOk = await doLogin();
-    if (!loginOk) {
-      if (fs.existsSync(COOKIES_PATH)) {
-        fs.unlinkSync(COOKIES_PATH);
-        log("🔄 Cookies deletados, recarregando...");
-        await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForTimeout(4000);
-        await dismissPopups();
-        if (!(await doLogin())) {
-          scraperStatus = "erro_login";
-          throw new Error("Login falhou após 2 tentativas");
-        }
-      } else {
-        scraperStatus = "erro_login";
-        throw new Error("Login falhou");
-      }
-    }
+    log("❌ Sessão injetada é inválida ou expirou.");
+    await page.screenshot({ path: path.join(__dirname, "erro-sessao.png") });
+    await handleSessionExpired();
   } else {
-    log("✅ Já está logado (cookies válidos)");
+    log("✅ Sessão válida — logado com sucesso via auth.json!");
   }
 
   // ═══ ETAPA 3: NAVEGAR PARA O JOGO ═══
@@ -282,7 +280,9 @@ async function runScraper() {
   await page.goto(GAME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForTimeout(5000);
   await dismissPopups();
-  await context.storageState({ path: COOKIES_PATH });
+  // Atualiza o auth.json com o estado atual da sessão (renova tokens)
+  await context.storageState({ path: AUTH_PATH });
+  log("💾 auth.json atualizado com estado da sessão atual");
 
   // ═══ ETAPA 4: ESPERAR IFRAME EVOLUTION ═══
   scraperStatus = "esperando_iframe";
@@ -298,19 +298,18 @@ async function runScraper() {
   }
 
   if (!evoFound) {
-    log("⚠️ Iframe não encontrado, tentando re-login...");
+    log("⚠️ Iframe não encontrado — verificando sessão...");
     await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(3000);
     await dismissPopups();
 
     if (!(await isLoggedIn())) {
-      if (fs.existsSync(COOKIES_PATH)) fs.unlinkSync(COOKIES_PATH);
-      if (!(await doLogin())) {
-        scraperStatus = "erro_login";
-        throw new Error("Re-login falhou");
-      }
+      log("❌ Sessão expirou enquanto tentava carregar o jogo.");
+      await page.screenshot({ path: path.join(__dirname, "erro-sessao.png") });
+      await handleSessionExpired();
     }
 
+    // Sessão ainda válida — tenta carregar o jogo de novo
     await page.goto(GAME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(5000);
     await dismissPopups();
@@ -331,7 +330,7 @@ async function runScraper() {
   }
 
   log("✅ Iframe Evolution detectado!");
-  await context.storageState({ path: COOKIES_PATH });
+  await context.storageState({ path: AUTH_PATH });
 
   log("⏳ Esperando jogo carregar...");
   await page.waitForTimeout(10000);
@@ -411,6 +410,7 @@ async function runScraper() {
       } else if (currentFirst !== previousFirst) {
         insertStmt.run(currentFirst);
         totalCaptured++;
+        lastNewNumberAt = Date.now();  // ← atualiza o watchdog
         log(`🏆 NOVO: ${currentFirst} (total: ${totalCaptured})`);
       }
 
@@ -433,36 +433,80 @@ async function runScraper() {
       if (lastNumbers.length > 0) break;
     }
   }
+  // Inicializa o watchdog a partir do momento que os dados chegaram
+  lastNewNumberAt = Date.now();
 
   const pollId = setInterval(async () => {
     await pollResults();
+
+    // ─── WATCHDOG: iframe congelado / dado estático ───────────────────
+    // Quando o iframe trava, o bot lê sempre o mesmo número e não gera
+    // erros consecutivos — só para de salvar silenciosamente.
+    const staleSince = lastNewNumberAt ? Date.now() - lastNewNumberAt : 0;
+    if (lastNewNumberAt && staleSince > STALE_TIMEOUT_MS && consecutiveErrors === 0) {
+      const staleMin = Math.round(staleSince / 60000);
+      log(`⏰ WATCHDOG: ${staleMin}min sem número novo — iframe pode estar congelado. Recarregando jogo...`);
+      scraperStatus = "recarregando_jogo";
+      try {
+        await page.goto(GAME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.waitForTimeout(8000);
+        await dismissPopups();
+
+        // Verifica se ainda está logado após o reload
+        if (!(await isLoggedIn())) {
+          log("❌ Sessão expirou durante watchdog reload.");
+          await page.screenshot({ path: path.join(__dirname, "erro-sessao.png") });
+          clearInterval(pollId);
+          clearInterval(authSaveId);
+          await handleSessionExpired();
+          return;
+        }
+
+        // Reseta previousFirst para forçar captura do estado atual
+        previousFirst = null;
+        lastNewNumberAt = Date.now();
+        consecutiveErrors = 0;
+        scraperStatus = "capturando";
+        log("✅ Watchdog: jogo recarregado com sucesso!");
+      } catch (e) {
+        log(`❌ Watchdog: erro ao recarregar jogo: ${e.message}`);
+      }
+      return; // evita checar consecutiveErrors neste ciclo
+    }
+    // ─────────────────────────────────────────────────────────────────
+
     if (consecutiveErrors >= 10 && consecutiveErrors < MAX_ERRORS_BEFORE_RESTART) {
       const currentUrl = page.url();
       if (!currentUrl.includes("immersive-roulette")) {
-        log("🔑 Sessão expirada — fazendo re-login sem reiniciar o browser...");
-        scraperStatus = "refazendo_login";
+        log("⚠️ Sessão potencialmente expirada — verificando...");
+        scraperStatus = "verificando_sessao";
         try {
           await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
           await page.waitForTimeout(3000);
           await dismissPopups();
           if (!(await isLoggedIn())) {
-            if (fs.existsSync(COOKIES_PATH)) fs.unlinkSync(COOKIES_PATH);
-            await doLogin();
+            // Sessão expirou — aguarda novo auth.json (não tenta login automático)
+            clearInterval(pollId);
+            clearInterval(authSaveId);
+            await handleSessionExpired();
+          } else {
+            // Sessão ainda válida — navega de volta ao jogo
+            await page.goto(GAME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+            await page.waitForTimeout(5000);
+            await dismissPopups();
+            consecutiveErrors = 0;
+            lastNewNumberAt = Date.now();
+            scraperStatus = "capturando";
+            log("✅ Sessão OK — voltando a capturar");
           }
-          await page.goto(GAME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-          await page.waitForTimeout(5000);
-          await dismissPopups();
-          consecutiveErrors = 0;
-          scraperStatus = "capturando";
-          log("✅ Re-login concluído, voltando a capturar");
         } catch (e) {
-          log(`❌ Erro no re-login: ${e.message}`);
+          log(`❌ Erro ao verificar sessão: ${e.message}`);
         }
       }
     } else if (consecutiveErrors >= MAX_ERRORS_BEFORE_RESTART) {
-      log("🔄 Muitos erros consecutivos — reiniciando...");
+      log("🔄 Muitos erros consecutivos — reiniciando browser...");
       clearInterval(pollId);
-      clearInterval(cookieSaveId);
+      clearInterval(authSaveId);
       scraperStatus = "reiniciando";
       try { await browser.close(); } catch (e) {}
       browser = null;
@@ -471,8 +515,13 @@ async function runScraper() {
     }
   }, POLL_INTERVAL);
 
-  const cookieSaveId = setInterval(async () => {
-    try { await context.storageState({ path: COOKIES_PATH }); } catch (e) {}
+  // Persiste o storageState periodicamente para renovar tokens
+  const authSaveId = setInterval(async () => {
+    try {
+      await context.storageState({ path: AUTH_PATH });
+    } catch (e) {
+      log(`⚠️ Falha ao salvar auth.json: ${e.message}`);
+    }
   }, 60000);
 
   log("");
@@ -542,13 +591,20 @@ app.get("/api/resultados", (req, res) => {
 
 app.get("/api/status", (req, res) => {
   const total = countStmt.get().total;
+  const authExists = fs.existsSync(AUTH_PATH);
+  const staleSinceMs = lastNewNumberAt ? Date.now() - lastNewNumberAt : null;
   res.json({
     status: scraperStatus,
+    auth_json_presente: authExists,
     numeros_no_banco: total,
     numeros_capturados_sessao: totalCaptured,
     erros_consecutivos: consecutiveErrors,
     erros_total: errorCount,
     ultimo_update: lastUpdate,
+    ultimo_numero_novo_ha: staleSinceMs ? `${Math.round(staleSinceMs / 1000)}s atrás` : null,
+    watchdog_dispara_em: staleSinceMs
+      ? `${Math.round((STALE_TIMEOUT_MS - staleSinceMs) / 1000)}s`
+      : null,
     ultimos_numeros: lastNumbers.slice(0, 13),
     restarts: restartCount,
     uptime_seconds: Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000),
