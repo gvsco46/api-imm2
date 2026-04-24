@@ -228,34 +228,9 @@ async function runScraper() {
 
   // ─── Helper: verificar se ainda está logado ───
   async function isLoggedIn() {
-    const loggedOutSelectors = [
-      'input[type="password"]',
-      "button.e2e-login",
-      'button:has-text("Entrar")',
-      'button:has-text("Login")',
-      'a:has-text("Entrar")',
-      '[href*="login"]',
-      'input[name="username"]',
-      'input[name="login"]',
-      'input[name="email"]',
-    ];
-
-    for (const sel of loggedOutSelectors) {
-      try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 1200 })) {
-          return false;
-        }
-      } catch (e) {}
-    }
-
     const loggedInSelectors = [
-      'button:has-text("Depositar")',
-      'a:has-text("Depositar")',
-      'button:has-text("Minha conta")',
-      'a:has-text("Minha conta")',
-      'button:has-text("Sair")',
-      'a:has-text("Sair")',
+      'text=/^Depositar$/i',
+      'text=/^R\\$\\s*[\\d.,]+$/i',
       '[data-testid*="account"]',
       '[data-testid*="user"]',
       '[data-testid*="balance"]',
@@ -267,6 +242,32 @@ async function runScraper() {
         const el = page.locator(sel).first();
         if (await el.isVisible({ timeout: 1200 })) {
           return true;
+        }
+      } catch (e) {}
+    }
+
+    for (const account of AUTO_LOGIN_ACCOUNTS) {
+      try {
+        const userBadge = page.locator(`text=${account.username}`).first();
+        if (await userBadge.isVisible({ timeout: 800 })) {
+          return true;
+        }
+      } catch (e) {}
+    }
+
+    const loggedOutSelectors = [
+      'input[type="password"]',
+      'input[name="username"]',
+      'input[name="login"]',
+      'input[name="email"]',
+      "button.e2e-login",
+    ];
+
+    for (const sel of loggedOutSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 1200 })) {
+          return false;
         }
       } catch (e) {}
     }
