@@ -196,11 +196,21 @@ async function runScraper() {
     for (const sel of [
       "#onetrust-accept-btn-handler",
       'button:has-text("Aceitar todos os cookies")',
+      'button:has-text("Aceitar cookies")',
+      'button:has-text("Aceitar")',
+      'button:has-text("Accept all cookies")',
+      'button:has-text("Accept All")',
+      'button:has-text("Allow all")',
+      '[id*="onetrust-accept"]',
+      '[class*="cookie"] button',
+      '[class*="consent"] button',
+      '[data-testid*="cookie"] button',
     ]) {
       try {
         const el = page.locator(sel).first();
         if (await el.isVisible({ timeout: 800 })) {
           await el.click({ force: true });
+          log(`🍪 Popup/cookies fechado via seletor: ${sel}`);
           await page.waitForTimeout(500);
         }
       } catch (e) {}
@@ -316,6 +326,7 @@ async function runScraper() {
     await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(2500);
     await dismissPopups();
+    await page.waitForTimeout(1000);
 
     if (await isLoggedIn()) {
       log("✅ Sessão já voltou logada antes de preencher credenciais.");
@@ -331,6 +342,7 @@ async function runScraper() {
     ], 3000);
     await page.waitForTimeout(1500);
     await dismissPopups();
+    await page.waitForTimeout(1000);
 
     const userSelector = await fillFirstVisible([
       'input[name="username"]',
@@ -354,6 +366,43 @@ async function runScraper() {
     ], account.password, 3000);
 
     if (!userSelector || !passSelector) {
+      await dismissPopups();
+      await page.waitForTimeout(1000);
+
+      const retryUserSelector = await fillFirstVisible([
+        'input[name="username"]',
+        'input[name="login"]',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="username"]',
+        'input[placeholder*="usuário" i]',
+        'input[placeholder*="usuario" i]',
+        'input[placeholder*="e-mail" i]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="CPF" i]',
+        'input[type="text"]',
+      ], account.username, 3000);
+
+      const retryPassSelector = await fillFirstVisible([
+        'input[name="password"]',
+        'input[type="password"]',
+        'input[autocomplete="current-password"]',
+        'input[placeholder*="senha" i]',
+      ], account.password, 3000);
+
+      if (retryUserSelector && retryPassSelector) {
+        log("✅ Campos de login apareceram após fechar popup/cookies.");
+        await submitLoginForm();
+        await page.waitForTimeout(7000);
+        await dismissPopups();
+
+        if (await isLoggedIn()) {
+          await context.storageState({ path: AUTH_PATH });
+          log("✅ Login automático OK — auth.json salvo com a nova sessão.");
+          return true;
+        }
+      }
+
       log("⚠️ Não encontrei os campos de usuário/senha no formulário de login.");
       await page.screenshot({ path: path.join(__dirname, `erro-login-form-${account.label}-${attempt}.png`) });
       return false;
