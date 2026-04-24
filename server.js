@@ -4,18 +4,17 @@
  * Captura números da Immersive Roulette (Evolution Gaming) no Superbet
  * via CDP (Chrome DevTools Protocol) para acessar iframes cross-origin.
  *
- * ── AUTENTICAÇÃO VIA SESSION INJECTION ──────────────────────────────────────
- * O Superbet exige reconhecimento facial, impossibilitando login automático.
- * A sessão é injetada via storageState (auth.json), gerado pelo script:
+ * ── AUTENTICAÇÃO VIA SESSION INJECTION + FALLBACK AUTOMÁTICO ────────────────
+ * A sessão preferencial é injetada via storageState (auth.json), gerado pelo script:
  *
  *   node login-manual.js   ← roda LOCALMENTE, você faz o login à mão
  *
- * O auth.json gerado deve ser transferido para o servidor antes de iniciar.
+ * Se a sessão expirar, o bot tenta login automático e salva um novo auth.json.
  * ────────────────────────────────────────────────────────────────────────────
  *
  * Features:
  *   - Session Injection via storageState (auth.json)
- *   - Sem tentativa de login automático (facial recognition bloquearia)
+ *   - Login automático de fallback quando a sessão manual expirar
  *   - Reconexão automática em caso de erro
  *   - Modo headless para produção
  *   - Graceful shutdown
@@ -31,6 +30,7 @@
  *   HEADLESS        → "true"/"false" (padrão: true)
  *   POLL_INTERVAL   → intervalo de polling em ms (padrão: 5000)
  *   AUTH_PATH       → caminho do auth.json (padrão: ./auth.json)
+ *   AUTO_LOGIN_ATTEMPTS → tentativas por conta no login automático (padrão: 4)
  */
 
 const { chromium } = require("playwright");
@@ -53,6 +53,24 @@ const AUTH_PATH = process.env.AUTH_PATH || path.join(__dirname, "auth.json");
 const GAME_URL = "https://superbet.bet.br/jogo/immersive-roulette/814483?demo=false";
 const HOME_URL = "https://superbet.bet.br";
 const HEADLESS = process.env.HEADLESS !== "false";
+const AUTO_LOGIN_ATTEMPTS = parseInt(process.env.AUTO_LOGIN_ATTEMPTS) || 4;
+const AUTO_LOGIN_ACCOUNTS = [
+  {
+    label: "principal",
+    username: process.env.SUPERBET_USER_PRIMARY || process.env.SUPERBET_USER || "gustavozikk111",
+    password: process.env.SUPERBET_PASS_PRIMARY || process.env.SUPERBET_PASS || "Tryndx@6",
+  },
+  {
+    label: "fallback",
+    username: process.env.SUPERBET_USER_FALLBACK || "analistamamede",
+    password: process.env.SUPERBET_PASS_FALLBACK || "@Paula03111992",
+  },
+  {
+    label: "fallback_2",
+    username: process.env.SUPERBET_USER_FALLBACK_2 || "agacci1221",
+    password: process.env.SUPERBET_PASS_FALLBACK_2 || "Agacci2006.",
+  },
+].filter((account) => account.username && account.password);
 
 // ═══════════════════════════════════════════════════════
 // BANCO DE DADOS
@@ -116,38 +134,25 @@ async function runScraper() {
     log("╔══════════════════════════════════════════════════════════════════╗");
     log("║  ⛔  auth.json NÃO ENCONTRADO                                   ║");
     log("║                                                                  ║");
-    log("║  Execute LOCALMENTE para gerar a sessão:                         ║");
+    log("║  O bot vai tentar login automático para gerar uma nova sessão.   ║");
+    log("║  Se o site pedir desafio/facial, gere manualmente com:           ║");
     log("║    node login-manual.js                                          ║");
     log("║                                                                  ║");
-    log("║  Depois transfira o auth.json gerado para este servidor e        ║");
-    log("║  reinicie o bot.                                                 ║");
     log("╚══════════════════════════════════════════════════════════════════╝");
     log("");
-    scraperStatus = "aguardando_auth";
-    // Fica em loop de espera sem travar o processo — a API continua respondendo
-    await new Promise((resolve) => {
-      const check = setInterval(() => {
-        if (fs.existsSync(AUTH_PATH)) {
-          log("✅ auth.json detectado! Iniciando scraper...");
-          clearInterval(check);
-          resolve();
-        } else {
-          log("⏳ Aguardando auth.json... (rode: node login-manual.js)");
-        }
-      }, 30000);
-    });
   }
 
   // ─── Validar auth.json ───
-  let authState;
-  try {
-    authState = JSON.parse(fs.readFileSync(AUTH_PATH, "utf8"));
-    log(`🔑 auth.json carregado (${authState.cookies?.length ?? 0} cookies, ${Object.keys(authState.origins ?? {}).length} origens)`);
-  } catch (e) {
-    log(`❌ auth.json corrompido ou inválido: ${e.message}`);
-    log("   Delete o arquivo e rode: node login-manual.js");
-    scraperStatus = "erro_auth";
-    throw new Error("auth.json inválido");
+  let authState = null;
+  if (hasAuth) {
+    try {
+      authState = JSON.parse(fs.readFileSync(AUTH_PATH, "utf8"));
+      log(`🔑 auth.json carregado (${authState.cookies?.length ?? 0} cookies, ${Object.keys(authState.origins ?? {}).length} origens)`);
+    } catch (e) {
+      log(`❌ auth.json corrompido ou inválido: ${e.message}`);
+      log("   O bot vai tentar login automático para gerar outro auth.json.");
+      scraperStatus = "erro_auth";
+    }
   }
 
   scraperStatus = "abrindo_browser";
@@ -165,13 +170,15 @@ async function runScraper() {
   });
 
   const contextOptions = {
-    storageState: AUTH_PATH, // ← Injeta a sessão completa (cookies + localStorage)
     viewport: { width: 1920, height: 1080 },
     userAgent:
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     geolocation: { latitude: -23.5505, longitude: -46.6333 },
     permissions: ["geolocation"],
   };
+  if (authState) {
+    contextOptions.storageState = AUTH_PATH; // Injeta a sessão completa (cookies + localStorage)
+  }
 
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
@@ -211,33 +218,185 @@ async function runScraper() {
 
   // ─── Helper: verificar se ainda está logado ───
   async function isLoggedIn() {
-    try {
-      const entrarBtn = page.locator("button.e2e-login");
-      return !(await entrarBtn.isVisible({ timeout: 3000 }));
-    } catch (e) {
-      return true;
+    const loggedOutSelectors = [
+      'input[type="password"]',
+      "button.e2e-login",
+      'button:has-text("Entrar")',
+      'button:has-text("Login")',
+      'a:has-text("Entrar")',
+      '[href*="login"]',
+      'input[name="username"]',
+      'input[name="login"]',
+      'input[name="email"]',
+    ];
+
+    for (const sel of loggedOutSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 1200 })) {
+          return false;
+        }
+      } catch (e) {}
     }
+
+    const loggedInSelectors = [
+      'button:has-text("Depositar")',
+      'a:has-text("Depositar")',
+      'button:has-text("Minha conta")',
+      'a:has-text("Minha conta")',
+      'button:has-text("Sair")',
+      'a:has-text("Sair")',
+      '[data-testid*="account"]',
+      '[data-testid*="user"]',
+      '[data-testid*="balance"]',
+      '[class*="balance"]',
+    ];
+
+    for (const sel of loggedInSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 1200 })) {
+          return true;
+        }
+      } catch (e) {}
+    }
+
+    const currentUrl = page.url();
+    if (currentUrl.includes("immersive-roulette")) {
+      const hasEvolutionFrame = page.frames().some((frame) => frame.url().includes("evo-games"));
+      if (hasEvolutionFrame) return true;
+    }
+
+    return false;
   }
 
-  // ─── Helper: sessão expirada — não tenta re-login, apenas avisa ───
-  async function handleSessionExpired() {
-    scraperStatus = "sessao_expirada";
-    log("");
-    log("╔══════════════════════════════════════════════════════════════════╗");
-    log("║  ⚠️  SESSÃO EXPIRADA — auth.json inválido                       ║");
-    log("║                                                                  ║");
-    log("║  1. Execute LOCALMENTE: node login-manual.js                     ║");
-    log("║  2. Transfira o novo auth.json para o servidor                   ║");
-    log("║  3. O bot detectará o novo arquivo automaticamente               ║");
-    log("╚══════════════════════════════════════════════════════════════════╝");
-    log("");
-    // Aguarda novo auth.json ser transferido (troca de arquivo em disco)
-    const oldMtime = fs.statSync(AUTH_PATH).mtimeMs;
+  async function clickFirstVisible(selectors, timeout = 1200) {
+    for (const sel of selectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout })) {
+          await el.click({ force: true });
+          return sel;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  async function fillFirstVisible(selectors, value, timeout = 1200) {
+    for (const sel of selectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout })) {
+          await el.fill(value);
+          return sel;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  async function submitLoginForm() {
+    const submitSelectors = [
+      'button[type="submit"]:has-text("Entrar")',
+      'button:has-text("Entrar")',
+      'button:has-text("Login")',
+      'button:has-text("Iniciar sessão")',
+      'button:has-text("Acessar")',
+      '[data-testid*="login"] button[type="submit"]',
+    ];
+    if (await clickFirstVisible(submitSelectors, 1000)) return;
+    await page.keyboard.press("Enter");
+  }
+
+  async function tryAutomaticLogin(account, attempt) {
+    log(`🔐 Login automático (${account.label}) tentativa ${attempt}/${AUTO_LOGIN_ATTEMPTS} — usuário: ${account.username}`);
+    scraperStatus = "login_automatico";
+
+    await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForTimeout(2500);
+    await dismissPopups();
+
+    if (await isLoggedIn()) {
+      log("✅ Sessão já voltou logada antes de preencher credenciais.");
+      await context.storageState({ path: AUTH_PATH });
+      return true;
+    }
+
+    await clickFirstVisible([
+      "button.e2e-login",
+      'button:has-text("Entrar")',
+      'button:has-text("Login")',
+      'a:has-text("Entrar")',
+    ], 3000);
+    await page.waitForTimeout(1500);
+    await dismissPopups();
+
+    const userSelector = await fillFirstVisible([
+      'input[name="username"]',
+      'input[name="login"]',
+      'input[name="email"]',
+      'input[type="email"]',
+      'input[autocomplete="username"]',
+      'input[placeholder*="usuário" i]',
+      'input[placeholder*="usuario" i]',
+      'input[placeholder*="e-mail" i]',
+      'input[placeholder*="email" i]',
+      'input[placeholder*="CPF" i]',
+      'input[type="text"]',
+    ], account.username, 3000);
+
+    const passSelector = await fillFirstVisible([
+      'input[name="password"]',
+      'input[type="password"]',
+      'input[autocomplete="current-password"]',
+      'input[placeholder*="senha" i]',
+    ], account.password, 3000);
+
+    if (!userSelector || !passSelector) {
+      log("⚠️ Não encontrei os campos de usuário/senha no formulário de login.");
+      await page.screenshot({ path: path.join(__dirname, `erro-login-form-${account.label}-${attempt}.png`) });
+      return false;
+    }
+
+    await submitLoginForm();
+    await page.waitForTimeout(7000);
+    await dismissPopups();
+
+    if (await isLoggedIn()) {
+      await context.storageState({ path: AUTH_PATH });
+      log("✅ Login automático OK — auth.json salvo com a nova sessão.");
+      return true;
+    }
+
+    await page.screenshot({ path: path.join(__dirname, `erro-login-${account.label}-${attempt}.png`) });
+    log("❌ Login automático não confirmou sessão logada.");
+    return false;
+  }
+
+  async function performAutomaticLogin() {
+    for (const account of AUTO_LOGIN_ACCOUNTS) {
+      for (let attempt = 1; attempt <= AUTO_LOGIN_ATTEMPTS; attempt++) {
+        try {
+          if (await tryAutomaticLogin(account, attempt)) return true;
+        } catch (e) {
+          log(`❌ Erro no login automático (${account.label}) tentativa ${attempt}: ${e.message}`);
+        }
+        await page.waitForTimeout(3000);
+      }
+      log(`⚠️ ${AUTO_LOGIN_ATTEMPTS} tentativas falharam para a conta ${account.label}.`);
+    }
+    return false;
+  }
+
+  async function waitForManualAuth() {
+    scraperStatus = "aguardando_auth";
+    const oldMtime = fs.existsSync(AUTH_PATH) ? fs.statSync(AUTH_PATH).mtimeMs : 0;
     await new Promise((resolve) => {
       const check = setInterval(() => {
         try {
-          const newMtime = fs.statSync(AUTH_PATH).mtimeMs;
-          if (newMtime !== oldMtime) {
+          const newMtime = fs.existsSync(AUTH_PATH) ? fs.statSync(AUTH_PATH).mtimeMs : 0;
+          if (newMtime && newMtime !== oldMtime) {
             log("✅ Novo auth.json detectado! Reiniciando scraper...");
             clearInterval(check);
             resolve();
@@ -249,12 +408,44 @@ async function runScraper() {
         }
       }, 30000);
     });
-    // Reinicia o scraper com a sessão nova
+  }
+
+  async function restartWithFreshSession(reason) {
     try { await browser.close(); } catch (e) {}
     browser = null;
     restartCount++;
     startScraper();
-    throw new Error("Reiniciando com nova sessão"); // encerra o runScraper atual
+    const err = new Error(reason);
+    err.restartAlreadyScheduled = true;
+    throw err;
+  }
+
+  // ─── Helper: sessão expirada — tenta re-login antes de pedir auth manual ───
+  async function handleSessionExpired() {
+    scraperStatus = "sessao_expirada";
+    log("");
+    log("╔══════════════════════════════════════════════════════════════════╗");
+    log("║  ⚠️  SESSÃO EXPIRADA — auth.json inválido                       ║");
+    log("║                                                                  ║");
+    log("║  Vou tentar login automático antes de pedir novo auth manual.    ║");
+    log("╚══════════════════════════════════════════════════════════════════╝");
+    log("");
+
+    if (await performAutomaticLogin()) {
+      await restartWithFreshSession("Reiniciando com sessão renovada por login automático");
+    }
+
+    log("");
+    log("╔══════════════════════════════════════════════════════════════════╗");
+    log("║  ⛔  LOGIN AUTOMÁTICO FALHOU                                    ║");
+    log("║                                                                  ║");
+    log("║  1. Execute LOCALMENTE: node login-manual.js                     ║");
+    log("║  2. Transfira o novo auth.json para o servidor                   ║");
+    log("║  3. O bot detectará o novo arquivo automaticamente               ║");
+    log("╚══════════════════════════════════════════════════════════════════╝");
+    log("");
+    await waitForManualAuth();
+    await restartWithFreshSession("Reiniciando com nova sessão manual");
   }
 
   // ═══ ETAPA 1: ACESSAR SUPERBET ═══
@@ -265,7 +456,7 @@ async function runScraper() {
   await dismissPopups();
   await page.waitForTimeout(1000);
 
-  // ═══ ETAPA 2: VERIFICAR SESSÃO (não tenta login automático) ═══
+  // ═══ ETAPA 2: VERIFICAR SESSÃO (tenta login automático se expirou) ═══
   if (!(await isLoggedIn())) {
     log("❌ Sessão injetada é inválida ou expirou.");
     await page.screenshot({ path: path.join(__dirname, "erro-sessao.png") });
@@ -485,7 +676,7 @@ async function runScraper() {
           await page.waitForTimeout(3000);
           await dismissPopups();
           if (!(await isLoggedIn())) {
-            // Sessão expirou — aguarda novo auth.json (não tenta login automático)
+            // Sessão expirou — tenta login automático antes de aguardar novo auth.json
             clearInterval(pollId);
             clearInterval(authSaveId);
             await handleSessionExpired();
@@ -540,6 +731,10 @@ async function startScraper() {
   try {
     await runScraper();
   } catch (err) {
+    if (err.restartAlreadyScheduled) {
+      log(`🔄 ${err.message}`);
+      return;
+    }
     log(`❌ Erro: ${err.message}`);
     scraperStatus = "erro_reconectando";
     try { if (browser) await browser.close(); } catch (e) {}
